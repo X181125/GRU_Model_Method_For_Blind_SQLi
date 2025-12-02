@@ -1,0 +1,10 @@
+{
+  "seq_length": 5,
+  "batch_size": 64,
+  "embedding_dim": 256,
+  "gru_units": 512,
+  "dropout_rate": 0.3,
+  "vocab_size": 46,
+  "initial_lr": 0.001,
+  "end_token_idx": 3
+}
