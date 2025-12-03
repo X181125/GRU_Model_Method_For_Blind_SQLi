@@ -1,6 +1,16 @@
 {
-  "test_loss": 2.246870517730713,
-  "test_accuracy": 0.48762667179107666,
-  "test_top5_accuracy": 0.8055620789527893,
-  "perplexity": 5.986229419708252
+  "test_loss": 2.1016271114349365,
+  "test_accuracy": 0.5459077954292297,
+  "test_top5_accuracy": 0.8363107442855835,
+  "perplexity": 5.193411827087402,
+  "total_epochs": 72,
+  "best_epoch": 32,
+  "improvements_applied": [
+    "Cyclic learning rate",
+    "Larger batch size (128)",
+    "Higher dropout (0.4)",
+    "Longer patience (40)",
+    "Shorter sequence (4)",
+    "Generation callback"
+  ]
 }
