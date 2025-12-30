@@ -1,0 +1,827 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SQLMap vs GRU Model - Blind SQLi Comparison</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            min-height: 100vh;
+            color: #fff;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        h1 {
+            font-size: 2.2rem;
+            background: linear-gradient(90deg, #00d4ff, #00ff88);
+            background-clip: text;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 10px;
+        }
+
+        .subtitle {
+            color: #888;
+            font-size: 1rem;
+        }
+
+        .main-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .card {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 15px;
+            padding: 20px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .card h2 {
+            font-size: 1.3rem;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .card.sqlmap h2 { color: #ff6b6b; }
+        .card.gru h2 { color: #00ff88; }
+
+        .icon {
+            width: 35px;
+            height: 35px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.3rem;
+        }
+
+        .sqlmap .icon { background: rgba(255, 107, 107, 0.2); }
+        .gru .icon { background: rgba(0, 255, 136, 0.2); }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .stat-box {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 12px;
+            border-radius: 8px;
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 1.8rem;
+            font-weight: bold;
+        }
+
+        .sqlmap .stat-value { color: #ff6b6b; }
+        .gru .stat-value { color: #00ff88; }
+
+        .stat-label {
+            color: #888;
+            font-size: 0.8rem;
+            margin-top: 3px;
+        }
+
+        .schema-display {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 15px;
+        }
+
+        .schema-display h3 {
+            font-size: 0.95rem;
+            margin-bottom: 10px;
+            color: #aaa;
+        }
+
+        .table-item {
+            margin: 8px 0;
+            padding: 10px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 6px;
+            border-left: 3px solid #444;
+        }
+
+        .table-item.found {
+            border-left-color: #00ff88;
+        }
+
+        .table-item.partial {
+            border-left-color: #ffbb00;
+        }
+
+        .table-name {
+            font-weight: bold;
+            font-family: monospace;
+            margin-bottom: 5px;
+        }
+
+        .column-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px;
+        }
+
+        .column-tag {
+            padding: 2px 8px;
+            background: rgba(0, 212, 255, 0.2);
+            border-radius: 10px;
+            font-size: 0.75rem;
+            color: #00d4ff;
+            font-family: monospace;
+        }
+
+        .column-tag.found {
+            background: rgba(0, 255, 136, 0.2);
+            color: #00ff88;
+        }
+
+        .column-tag.missing {
+            background: rgba(255, 107, 107, 0.2);
+            color: #ff6b6b;
+            text-decoration: line-through;
+        }
+
+        .steps-log {
+            background: rgba(0, 0, 0, 0.4);
+            border-radius: 8px;
+            padding: 12px;
+            max-height: 200px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 0.75rem;
+            line-height: 1.6;
+        }
+
+        .steps-log .step {
+            padding: 2px 0;
+            color: #aaa;
+        }
+
+        .steps-log .step.success {
+            color: #00ff88;
+        }
+
+        .comparison-section {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 15px;
+            padding: 25px;
+            margin-bottom: 25px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .comparison-section h2 {
+            text-align: center;
+            margin-bottom: 20px;
+            color: #00d4ff;
+        }
+
+        .bar-chart {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        .bar-item {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .bar-label {
+            width: 100px;
+            font-weight: bold;
+            font-size: 0.9rem;
+        }
+
+        .bar-container {
+            flex: 1;
+            height: 35px;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 8px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .bar {
+            height: 100%;
+            border-radius: 8px;
+            transition: width 1s ease-out;
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            padding-right: 12px;
+            font-weight: bold;
+            font-size: 0.9rem;
+        }
+
+        .bar.sqlmap {
+            background: linear-gradient(90deg, #ff6b6b, #ee5a5a);
+        }
+
+        .bar.gru {
+            background: linear-gradient(90deg, #00ff88, #00cc6a);
+        }
+
+        .result-box {
+            text-align: center;
+            margin-top: 25px;
+            padding: 20px;
+            background: rgba(0, 255, 136, 0.1);
+            border-radius: 12px;
+            border: 2px solid #00ff88;
+        }
+
+        .result-box.loading {
+            background: rgba(0, 212, 255, 0.1);
+            border-color: #00d4ff;
+        }
+
+        .result-box.tie {
+            background: rgba(255, 187, 0, 0.1);
+            border-color: #ffbb00;
+        }
+
+        .result-title {
+            font-size: 1rem;
+            margin-bottom: 8px;
+            color: #888;
+        }
+
+        .result-value {
+            font-size: 2.5rem;
+            font-weight: bold;
+            color: #00ff88;
+        }
+
+        .result-value.negative {
+            color: #ff6b6b;
+        }
+
+        .result-value.tie {
+            color: #ffbb00;
+        }
+
+        .btn {
+            padding: 12px 35px;
+            font-size: 1rem;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: all 0.3s ease;
+        }
+
+        .btn-primary {
+            background: linear-gradient(90deg, #00d4ff, #00ff88);
+            color: #1a1a2e;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(0, 212, 255, 0.3);
+        }
+
+        .btn-primary:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .controls {
+            text-align: center;
+            margin-bottom: 25px;
+        }
+
+        .db-info {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 15px;
+            padding: 20px;
+            margin-bottom: 25px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .db-info h2 {
+            margin-bottom: 15px;
+            color: #00d4ff;
+            font-size: 1.2rem;
+        }
+
+        .db-tables {
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 12px;
+        }
+
+        .db-table-card {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 10px;
+            padding: 12px;
+            text-align: center;
+        }
+
+        .db-table-card .name {
+            font-weight: bold;
+            color: #00d4ff;
+            font-family: monospace;
+            margin-bottom: 8px;
+        }
+
+        .db-table-card .columns {
+            font-size: 0.75rem;
+            color: #888;
+        }
+
+        .predictions-section {
+            margin-top: 15px;
+            padding-top: 15px;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .predictions-section h4 {
+            font-size: 0.85rem;
+            color: #888;
+            margin-bottom: 8px;
+        }
+
+        .predictions-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px;
+        }
+
+        .prediction-tag {
+            padding: 3px 10px;
+            background: rgba(0, 255, 136, 0.1);
+            border-radius: 12px;
+            font-size: 0.7rem;
+            color: #888;
+            border: 1px solid rgba(0, 255, 136, 0.2);
+            font-family: monospace;
+        }
+
+        .prediction-tag.matched {
+            background: rgba(0, 255, 136, 0.25);
+            border-color: #00ff88;
+            color: #00ff88;
+            font-weight: bold;
+        }
+
+        .loader {
+            width: 40px;
+            height: 40px;
+            border: 4px solid rgba(0, 212, 255, 0.2);
+            border-top: 4px solid #00d4ff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .hidden { display: none; }
+
+        .explanation {
+            background: rgba(0, 0, 0, 0.25);
+            border-radius: 8px;
+            padding: 12px;
+            margin-top: 12px;
+            font-size: 0.8rem;
+            color: #888;
+            line-height: 1.5;
+        }
+
+        .status-badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 15px;
+            font-size: 0.7rem;
+            font-weight: bold;
+            margin-left: 10px;
+        }
+
+        .status-badge.complete {
+            background: rgba(0, 255, 136, 0.2);
+            color: #00ff88;
+        }
+
+        .status-badge.incomplete {
+            background: rgba(255, 187, 0, 0.2);
+            color: #ffbb00;
+        }
+
+        @media (max-width: 900px) {
+            .main-grid { grid-template-columns: 1fr; }
+            .db-tables { grid-template-columns: repeat(2, 1fr); }
+            h1 { font-size: 1.6rem; }
+            .stats { grid-template-columns: repeat(2, 1fr); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔐 SQLMap vs GRU Model</h1>
+            <p class="subtitle">So sánh số lượng requests để tìm Tables + Columns trong Blind SQL Injection</p>
+        </header>
+
+        <!-- Database Schema Info -->
+        <div class="db-info">
+            <h2>📊 Target Database (5 Tables)</h2>
+            <div class="db-tables" id="dbTables">
+                <!-- Populated by JS -->
+            </div>
+        </div>
+
+        <!-- Controls -->
+        <div class="controls">
+            <button class="btn btn-primary" id="runCompareBtn" onclick="runComparison()">
+                🚀 Chạy So Sánh Song Song
+            </button>
+        </div>
+
+        <!-- Loading State -->
+        <div id="loadingSection" class="hidden">
+            <div class="comparison-section">
+                <div class="loader"></div>
+                <p style="text-align: center; color: #888;">Đang chạy 2 phương pháp song song...</p>
+            </div>
+        </div>
+
+        <!-- Results -->
+        <div id="resultsSection" class="hidden">
+            <!-- Comparison Chart -->
+            <div class="comparison-section">
+                <h2>📈 So Sánh Số Lượng Requests</h2>
+                <div class="bar-chart">
+                    <div class="bar-item">
+                        <span class="bar-label" style="color: #ff6b6b;">SQLMap</span>
+                        <div class="bar-container">
+                            <div class="bar sqlmap" id="sqlmapBar" style="width: 0%;">
+                                <span id="sqlmapBarValue">0</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="bar-item">
+                        <span class="bar-label" style="color: #00ff88;">GRU Model</span>
+                        <div class="bar-container">
+                            <div class="bar gru" id="gruBar" style="width: 0%;">
+                                <span id="gruBarValue">0</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="result-box" id="resultBox">
+                    <div class="result-title">Requests tiết kiệm được với GRU</div>
+                    <div class="result-value" id="savedRequests">0</div>
+                    <div style="margin-top: 8px; color: #888; font-size: 0.9rem;">
+                        <span id="improvementPercent">0</span>% hiệu quả hơn
+                    </div>
+                </div>
+            </div>
+
+            <!-- Method Details Grid -->
+            <div class="main-grid">
+                <!-- SQLMap Card -->
+                <div class="card sqlmap">
+                    <h2>
+                        <span class="icon">🔨</span>
+                        SQLMap
+                        <span class="status-badge" id="sqlmapStatus">-</span>
+                    </h2>
+                    
+                    <div class="stats">
+                        <div class="stat-box">
+                            <div class="stat-value" id="sqlmapRequests">0</div>
+                            <div class="stat-label">Requests</div>
+                        </div>
+                        <div class="stat-box">
+                            <div class="stat-value" id="sqlmapTables">0</div>
+                            <div class="stat-label">Tables</div>
+                        </div>
+                        <div class="stat-box">
+                            <div class="stat-value" id="sqlmapColumns">0</div>
+                            <div class="stat-label">Columns</div>
+                        </div>
+                    </div>
+
+                    <div class="schema-display">
+                        <h3>Kết quả tìm được:</h3>
+                        <div id="sqlmapResults"></div>
+                    </div>
+
+                    <div class="explanation">
+                        <strong>Phương pháp:</strong> Brute-force từng ký tự<br>
+                        • Dùng binary search trên charset (a-z, 0-9, _)<br>
+                        • ~37 requests/ký tự (worst case)<br>
+                        • Phải tìm độ dài trước, rồi từng ký tự
+                    </div>
+
+                    <details style="margin-top: 10px;">
+                        <summary style="cursor: pointer; color: #888; font-size: 0.85rem;">📋 Chi tiết các bước</summary>
+                        <div class="steps-log" id="sqlmapSteps"></div>
+                    </details>
+                </div>
+
+                <!-- GRU Model Card -->
+                <div class="card gru">
+                    <h2>
+                        <span class="icon">🧠</span>
+                        GRU Model
+                        <span class="status-badge" id="gruStatus">-</span>
+                    </h2>
+                    
+                    <div class="stats">
+                        <div class="stat-box">
+                            <div class="stat-value" id="gruRequests">0</div>
+                            <div class="stat-label">Requests</div>
+                        </div>
+                        <div class="stat-box">
+                            <div class="stat-value" id="gruTables">0</div>
+                            <div class="stat-label">Tables</div>
+                        </div>
+                        <div class="stat-box">
+                            <div class="stat-value" id="gruColumns">0</div>
+                            <div class="stat-label">Columns</div>
+                        </div>
+                    </div>
+
+                    <div class="schema-display">
+                        <h3>Kết quả tìm được:</h3>
+                        <div id="gruResults"></div>
+                    </div>
+
+                    <div class="explanation">
+                        <strong>Phương pháp:</strong> Smart Prediction<br>
+                        • Dùng GRU model + Trie để sinh predictions<br>
+                        • Verify từng prediction (1 request/prediction)<br>
+                        • Ưu tiên tên phổ biến (users, products, orders...)
+                    </div>
+
+                    <div class="predictions-section">
+                        <h4>Sample Predictions (được highlight nếu match):</h4>
+                        <div class="predictions-list" id="predictionsList"></div>
+                    </div>
+
+                    <details style="margin-top: 10px;">
+                        <summary style="cursor: pointer; color: #888; font-size: 0.85rem;">📋 Chi tiết các bước</summary>
+                        <div class="steps-log" id="gruSteps"></div>
+                    </details>
+
+                    <details style="margin-top: 10px;">
+                        <summary style="cursor: pointer; color: #00ff88; font-size: 0.85rem;">🧠 Quá trình GRU Generation (THỰC SỰ dùng model)</summary>
+                        <div class="steps-log" id="gruGenerationLog" style="background: rgba(0,255,136,0.05);"></div>
+                    </details>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Load DB info on page load
+        document.addEventListener('DOMContentLoaded', loadDbInfo);
+
+        async function loadDbInfo() {
+            try {
+                const response = await fetch('/api/db_info');
+                const data = await response.json();
+                
+                const container = document.getElementById('dbTables');
+                container.innerHTML = '';
+                
+                for (const [table, columns] of Object.entries(data.schema)) {
+                    const card = document.createElement('div');
+                    card.className = 'db-table-card';
+                    card.innerHTML = `
+                        <div class="name">${table}</div>
+                        <div class="columns">${columns.join(', ')}</div>
+                    `;
+                    container.appendChild(card);
+                }
+            } catch (error) {
+                console.error('Error loading DB info:', error);
+            }
+        }
+
+        async function runComparison() {
+            const btn = document.getElementById('runCompareBtn');
+            const resultsSection = document.getElementById('resultsSection');
+            const loadingSection = document.getElementById('loadingSection');
+            
+            btn.disabled = true;
+            btn.textContent = '⏳ GRU Model đang sinh predictions...';
+            resultsSection.classList.add('hidden');
+            loadingSection.classList.remove('hidden');
+            
+            try {
+                const response = await fetch('/api/compare', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({})
+                });
+                
+                const data = await response.json();
+                console.log('GRU Generation Log:', data.gru.generation_log);
+                
+                loadingSection.classList.add('hidden');
+                resultsSection.classList.remove('hidden');
+                
+                // Update comparison bars
+                const sqlmapReqs = data.sqlmap.requests;
+                const gruReqs = data.gru.requests;
+                const maxReqs = Math.max(sqlmapReqs, gruReqs);
+                
+                setTimeout(() => {
+                    document.getElementById('sqlmapBar').style.width = `${(sqlmapReqs / maxReqs) * 100}%`;
+                    document.getElementById('gruBar').style.width = `${(gruReqs / maxReqs) * 100}%`;
+                }, 100);
+                
+                document.getElementById('sqlmapBarValue').textContent = sqlmapReqs;
+                document.getElementById('gruBarValue').textContent = gruReqs;
+                
+                // Update stats
+                document.getElementById('sqlmapRequests').textContent = sqlmapReqs;
+                document.getElementById('sqlmapTables').textContent = data.sqlmap.tables_count;
+                document.getElementById('sqlmapColumns').textContent = data.sqlmap.columns_count;
+                
+                document.getElementById('gruRequests').textContent = gruReqs;
+                document.getElementById('gruTables').textContent = data.gru.tables_count;
+                document.getElementById('gruColumns').textContent = data.gru.columns_count;
+                
+                // Update status badges
+                const sqlmapStatus = document.getElementById('sqlmapStatus');
+                const gruStatus = document.getElementById('gruStatus');
+                
+                sqlmapStatus.textContent = data.comparison.sqlmap_complete ? '✓ Complete' : '⚠ Incomplete';
+                sqlmapStatus.className = `status-badge ${data.comparison.sqlmap_complete ? 'complete' : 'incomplete'}`;
+                
+                gruStatus.textContent = data.comparison.gru_complete ? '✓ Complete' : '⚠ Incomplete';
+                gruStatus.className = `status-badge ${data.comparison.gru_complete ? 'complete' : 'incomplete'}`;
+                
+                // Update result box
+                const saved = data.comparison.requests_saved;
+                const savedEl = document.getElementById('savedRequests');
+                const resultBox = document.getElementById('resultBox');
+                
+                if (saved > 0) {
+                    savedEl.textContent = `+${saved}`;
+                    savedEl.className = 'result-value';
+                    resultBox.className = 'result-box';
+                } else if (saved < 0) {
+                    savedEl.textContent = saved;
+                    savedEl.className = 'result-value negative';
+                    resultBox.className = 'result-box';
+                    resultBox.style.borderColor = '#ff6b6b';
+                    resultBox.style.background = 'rgba(255, 107, 107, 0.1)';
+                } else {
+                    savedEl.textContent = '0';
+                    savedEl.className = 'result-value tie';
+                    resultBox.className = 'result-box tie';
+                }
+                
+                document.getElementById('improvementPercent').textContent = data.comparison.improvement_percent;
+                
+                // Update results display
+                updateResultsDisplay('sqlmapResults', data.sqlmap.tables_found, data.actual_schema);
+                updateResultsDisplay('gruResults', data.gru.tables_found, data.actual_schema);
+                
+                // Update steps
+                updateSteps('sqlmapSteps', data.sqlmap.steps);
+                updateSteps('gruSteps', data.gru.steps);
+                
+                // Update predictions
+                updatePredictions(data.gru.sample_predictions, data.actual_schema);
+                
+                // Update GRU Generation Log
+                updateGenerationLog(data.gru.generation_log);
+                
+            } catch (error) {
+                console.error('Error:', error);
+                alert('Có lỗi: ' + error.message);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '🚀 Chạy So Sánh Song Song';
+            }
+        }
+
+        function updateGenerationLog(log) {
+            const el = document.getElementById('gruGenerationLog');
+            if (!log || log.length === 0) {
+                el.innerHTML = '<div class="step">Không có log</div>';
+                return;
+            }
+            
+            let html = '';
+            for (const entry of log) {
+                if (entry.phase === 'START') {
+                    html += `<div class="step success">🚀 ${entry.description}</div>`;
+                    html += `<div class="step">   Số prefixes: ${entry.prefixes_to_try}</div>`;
+                } else if (entry.phase === 'GRU_GENERATE') {
+                    html += `<div class="step">📝 Prefix "${entry.prefix}":</div>`;
+                    html += `<div class="step success">   → Generated: [${entry.generated.join(', ')}]</div>`;
+                    if (entry.added && entry.added.length > 0) {
+                        html += `<div class="step" style="color:#00ff88">   ✓ Added: [${entry.added.join(', ')}]</div>`;
+                    }
+                } else if (entry.phase === 'TRIE_AUGMENT') {
+                    html += `<div class="step">📚 ${entry.description}</div>`;
+                } else if (entry.phase === 'TRIE_RESULT') {
+                    html += `<div class="step">   Thêm ${entry.words_from_trie} từ từ Trie</div>`;
+                    if (entry.sample) {
+                        html += `<div class="step">   Sample: [${entry.sample.slice(0, 10).join(', ')}...]</div>`;
+                    }
+                } else if (entry.phase === 'DONE') {
+                    html += `<div class="step success">✅ Tổng: ${entry.total_predictions} predictions</div>`;
+                    html += `<div class="step">   First 10: [${entry.sample.slice(0, 10).join(', ')}]</div>`;
+                }
+            }
+            el.innerHTML = html;
+        }
+
+        function updateResultsDisplay(elementId, found, actual) {
+            const el = document.getElementById(elementId);
+            const actualTables = Object.keys(actual).map(t => t.toLowerCase());
+            
+            let html = '';
+            
+            // Show all actual tables, highlight what was found
+            for (const [actualTable, actualCols] of Object.entries(actual)) {
+                const foundTable = Object.keys(found).find(t => t.toLowerCase() === actualTable.toLowerCase());
+                const foundCols = foundTable ? found[foundTable] : [];
+                const foundColsLower = foundCols.map(c => c.toLowerCase());
+                
+                const allColsFound = actualCols.every(c => foundColsLower.includes(c.toLowerCase()));
+                const tableClass = foundTable ? (allColsFound ? 'found' : 'partial') : '';
+                
+                html += `<div class="table-item ${tableClass}">`;
+                html += `<div class="table-name">${foundTable ? '✓' : '✗'} ${actualTable}</div>`;
+                html += `<div class="column-list">`;
+                
+                for (const col of actualCols) {
+                    const colFound = foundColsLower.includes(col.toLowerCase());
+                    html += `<span class="column-tag ${colFound ? 'found' : 'missing'}">${col}</span>`;
+                }
+                
+                html += `</div></div>`;
+            }
+            
+            el.innerHTML = html;
+        }
+
+        function updateSteps(elementId, steps) {
+            const el = document.getElementById(elementId);
+            el.innerHTML = steps.map(step => {
+                const isSuccess = step.includes('✓') || step.includes('Tìm thấy');
+                return `<div class="step ${isSuccess ? 'success' : ''}">${step}</div>`;
+            }).join('');
+        }
+
+        function updatePredictions(predictions, actual) {
+            const el = document.getElementById('predictionsList');
+            const actualNames = [
+                ...Object.keys(actual).map(t => t.toLowerCase()),
+                ...Object.values(actual).flat().map(c => c.toLowerCase())
+            ];
+            
+            el.innerHTML = predictions.slice(0, 25).map(pred => {
+                const matched = actualNames.includes(pred.toLowerCase());
+                return `<span class="prediction-tag ${matched ? 'matched' : ''}">${pred}</span>`;
+            }).join('');
+        }
+    </script>
+</body>
+</html>
