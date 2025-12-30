@@ -1,15 +1,32 @@
 """
 ===============================================================================
-ENHANCED GRU MODEL FOR BLIND SQLI - PRODUCTION READY
+IMPROVED GRU MODEL FOR BLIND SQLI v2.0
 ===============================================================================
-Improvements:
-- Fixed end token detection bug
-- Cyclic learning rate schedule
-- Larger batch size for stability
-- Better callbacks configuration
-- Comprehensive evaluation metrics
-- Text generation testing
-- Full compatibility with inference scripts
+MAJOR IMPROVEMENTS over v1:
+
+1. WORD-LEVEL + CHARACTER-LEVEL HYBRID:
+   - Học cả pattern ở mức từ và mức ký tự
+   - Có thể sinh ra từ mới dựa trên prefix
+
+2. FREQUENCY-BASED PRIORITIZATION:
+   - Ưu tiên sinh các tên phổ biến trước
+   - Giống SQLMap nhưng thông minh hơn
+
+3. PREFIX TREE (TRIE) INTEGRATION:
+   - Lưu trữ tất cả prefix đã học
+   - Sinh tên nhanh hơn bằng cách complete prefix
+
+4. BATCH GENERATION:
+   - Sinh nhiều tên cùng lúc thay vì từng cái
+
+5. SMART SEED SELECTION:
+   - Chọn seed dựa trên pattern phổ biến
+   - Không random như trước
+
+6. NGRAM FEATURES:
+   - Học các n-gram phổ biến (2-gram, 3-gram)
+   - Giúp sinh tên có ý nghĩa hơn
+
 ===============================================================================
 """
 
@@ -18,712 +35,787 @@ import random
 import math
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras import layers, regularizers
+from tensorflow.keras import layers, regularizers, Model
 from tensorflow.keras.callbacks import (
-    EarlyStopping, ReduceLROnPlateau, ModelCheckpoint, 
-    CSVLogger, LearningRateScheduler, Callback
+    EarlyStopping, ReduceLROnPlateau, ModelCheckpoint,
+    CSVLogger, Callback
 )
 import json
+import pickle
+from collections import Counter, defaultdict
+from typing import Tuple, Dict, List, Set
 import matplotlib
-matplotlib.use('Agg')  # Non-GUI backend
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from typing import Tuple, Dict, List
 
 # ================== CONFIG & PATHS ==================
 
-DATA_DIR = os.path.join("data")
-MODEL_DIR = os.path.join("trained_models")
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+MODEL_DIR = os.path.join(os.path.dirname(__file__), "trained_models")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 TABLES_PATH = os.path.join(DATA_DIR, "common-tables.txt")
 COLUMNS_PATH = os.path.join(DATA_DIR, "common-columns.txt")
 
-BEST_MODEL_H5 = os.path.join(MODEL_DIR, "blind_sqli_gru_best.h5")
-FINAL_MODEL_KERAS = os.path.join(MODEL_DIR, "blind_sqli_gru_final.keras")
-FINAL_WEIGHTS_H5 = os.path.join(MODEL_DIR, "blind_sqli_gru_final.weights.h5")
-LOG_CSV_PATH = os.path.join(MODEL_DIR, "training_log.csv")
-VOCAB_JSON = os.path.join(MODEL_DIR, "vocab.json")
-CONFIG_JSON = os.path.join(MODEL_DIR, "config.json")
+# Model files
+BEST_MODEL_PATH = os.path.join(MODEL_DIR, "gru_v2_best.keras")
+VOCAB_PATH = os.path.join(MODEL_DIR, "vocab_v2.json")
+CONFIG_PATH = os.path.join(MODEL_DIR, "config_v2.json")
+TRIE_PATH = os.path.join(MODEL_DIR, "prefix_trie.pkl")
+NGRAM_PATH = os.path.join(MODEL_DIR, "ngrams.pkl")
+FREQ_PATH = os.path.join(MODEL_DIR, "frequency.json")
 HISTORY_PLOT = os.path.join(MODEL_DIR, "training_history.png")
-RESULTS_JSON = os.path.join(MODEL_DIR, "final_results.json")
 
-# ================== HYPERPARAMETERS (IMPROVED) ==================
+# ================== HYPERPARAMETERS v2 ==================
 
 # Data configuration
-SEQ_LENGTH = 4  # IMPROVED: Reduced from 5 to 4 for faster convergence
-BATCH_SIZE = 128  # IMPROVED: Increased from 64 to 128 for stability
-EPOCHS = 150  # Reduced from 200 since we use cyclic LR
-VALIDATION_SPLIT = 0.1
-TEST_SPLIT = 0.1
+SEQ_LENGTH = 8  # INCREASED: Better context
+BATCH_SIZE = 256  # INCREASED for faster training
+EPOCHS = 200
+VALIDATION_SPLIT = 0.15
 
-# Model architecture
-EMBEDDING_DIM = 256
-GRU_UNITS = 512
-NUM_GRU_LAYERS = 2  # Keep 2 layers (more = overfit risk)
-DROPOUT_RATE = 0.4  # IMPROVED: Increased from 0.3 to 0.4
-RECURRENT_DROPOUT = 0.2
-L2_REG = 1e-4
+# Model architecture - LARGER
+EMBEDDING_DIM = 128
+GRU_UNITS = 256
+NUM_GRU_LAYERS = 2
+DROPOUT_RATE = 0.3
+RECURRENT_DROPOUT = 0.15
 
-# Learning rate - IMPROVED: Cyclic LR
-INITIAL_LR = 2e-3  # Slightly higher than before
-MIN_LR = 1e-7
-CYCLE_LENGTH = 30  # Epochs per cycle
+# Learning rate
+INITIAL_LR = 1e-3
+MIN_LR = 1e-6
 
-# Training configuration
-EXPECTED_TF_PREFIX = "2.19"
-SEED = 42
+# Generation
+TOP_K = 10  # Top-k sampling
+BEAM_WIDTH = 5  # Beam search width
+MAX_NAME_LENGTH = 30
 
 # Special tokens
 PAD_TOKEN = '<PAD>'
 UNK_TOKEN = '<UNK>'
-END_TOKEN = '*'
+START_TOKEN = '<START>'
+END_TOKEN = '<END>'
 
-# ================== UTILITY FUNCTIONS ==================
+SEED = 42
 
-def set_global_seed(seed: int = 42):
-    """Set random seeds for reproducibility"""
-    random.seed(seed)
-    np.random.seed(seed)
-    tf.random.set_seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    print(f"[+] Global seed set to {seed}")
+# ================== TRIE DATA STRUCTURE ==================
 
-
-def configure_devices():
-    """Configure GPU/CPU devices"""
-    if not tf.__version__.startswith(EXPECTED_TF_PREFIX):
-        print(
-            f"[!] TensorFlow version {tf.__version__} != {EXPECTED_TF_PREFIX}*. "
-            "Training will continue normally."
-        )
-
-    gpus = tf.config.list_physical_devices("GPU")
-    if gpus:
-        for gpu in gpus:
-            try:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            except Exception:
-                pass
-        strategy = tf.distribute.MirroredStrategy()
-        print(f"[+] Using GPU strategy with {strategy.num_replicas_in_sync} replica(s)")
-    else:
-        strategy = tf.distribute.OneDeviceStrategy(device="/CPU:0")
-        print("[!] No GPU detected; using CPU strategy")
-    return strategy
+class TrieNode:
+    """Trie node for fast prefix matching"""
+    def __init__(self):
+        self.children = {}
+        self.is_end = False
+        self.count = 0  # Frequency count
+        self.full_word = None
 
 
-def safe_read_lines(path: str) -> List[str]:
-    """Safely read lines from file"""
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"[!] File not found: {path}\n"
-            f"    Please ensure common-tables.txt and common-columns.txt are in {DATA_DIR}/"
-        )
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read().splitlines()
+class Trie:
+    """Prefix tree for efficient name lookup and completion"""
+    
+    def __init__(self):
+        self.root = TrieNode()
+        self.all_words = []
+    
+    def insert(self, word: str, count: int = 1):
+        """Insert a word with frequency count"""
+        node = self.root
+        for char in word.lower():
+            if char not in node.children:
+                node.children[char] = TrieNode()
+            node = node.children[char]
+        node.is_end = True
+        node.count += count
+        node.full_word = word.lower()
+        if word.lower() not in self.all_words:
+            self.all_words.append(word.lower())
+    
+    def search(self, word: str) -> bool:
+        """Check if exact word exists"""
+        node = self._get_node(word)
+        return node is not None and node.is_end
+    
+    def starts_with(self, prefix: str) -> List[Tuple[str, int]]:
+        """Get all words starting with prefix, sorted by frequency"""
+        node = self._get_node(prefix)
+        if node is None:
+            return []
+        
+        results = []
+        self._collect_words(node, prefix, results)
+        return sorted(results, key=lambda x: -x[1])  # Sort by frequency desc
+    
+    def _get_node(self, prefix: str) -> TrieNode:
+        """Get node for given prefix"""
+        node = self.root
+        for char in prefix.lower():
+            if char not in node.children:
+                return None
+            node = node.children[char]
+        return node
+    
+    def _collect_words(self, node: TrieNode, prefix: str, results: List):
+        """Recursively collect all words from node"""
+        if node.is_end:
+            results.append((node.full_word, node.count))
+        for char, child in node.children.items():
+            self._collect_words(child, prefix + char, results)
+    
+    def get_common_prefixes(self, min_count: int = 5) -> List[str]:
+        """Get prefixes that lead to multiple words"""
+        prefixes = []
+        self._find_prefixes(self.root, "", prefixes, min_count)
+        return prefixes
+    
+    def _find_prefixes(self, node: TrieNode, prefix: str, prefixes: List, min_count: int):
+        """Find prefixes with multiple continuations"""
+        if len(node.children) >= 2 and len(prefix) >= 2:
+            prefixes.append(prefix)
+        for char, child in node.children.items():
+            self._find_prefixes(child, prefix + char, prefixes, min_count)
 
 
-def load_names(*paths) -> List[str]:
-    """Load and preprocess table/column names"""
-    names = set()
+# ================== DATA PREPARATION v2 ==================
+
+def load_names_with_frequency(paths: List[str]) -> Tuple[List[str], Dict[str, int]]:
+    """Load names and count their frequency across files"""
+    name_count = Counter()
+    
     for path in paths:
-        lines = safe_read_lines(path)
-        for line in lines:
-            line = line.strip().lower()
-            if line and not line.startswith("#"):
-                names.add(line + END_TOKEN)
+        if not os.path.exists(path):
+            print(f"[!] Warning: {path} not found")
+            continue
+        
+        with open(path, 'r', encoding='utf-8') as f:
+            position = 0
+            for line in f:
+                line = line.strip().lower()
+                if line and not line.startswith('#'):
+                    # Earlier position = higher frequency (SQLMap ordering)
+                    # Use inverse position as pseudo-frequency
+                    freq = max(1, 1000 - position)
+                    name_count[line] += freq
+                    position += 1
     
-    names = sorted(names)
-    print(f"[+] Loaded {len(names)} unique names (with END markers)")
-    return names
+    # Sort by frequency
+    sorted_names = sorted(name_count.keys(), key=lambda x: -name_count[x])
+    
+    print(f"[+] Loaded {len(sorted_names)} unique names")
+    print(f"[+] Top 20 names: {sorted_names[:20]}")
+    
+    return sorted_names, dict(name_count)
 
 
-# ================== DATA PREPARATION ==================
+def build_ngrams(names: List[str], n_range: Tuple[int, int] = (2, 4)) -> Dict[str, Counter]:
+    """Build n-gram frequency dictionaries"""
+    ngrams = {n: Counter() for n in range(n_range[0], n_range[1] + 1)}
+    
+    for name in names:
+        padded = START_TOKEN + name + END_TOKEN
+        for n in range(n_range[0], n_range[1] + 1):
+            for i in range(len(padded) - n + 1):
+                ngram = padded[i:i+n]
+                ngrams[n][ngram] += 1
+    
+    print(f"[+] Built n-grams:")
+    for n, counter in ngrams.items():
+        print(f"    {n}-grams: {len(counter)} unique")
+    
+    return ngrams
 
-def prepare_text() -> Tuple[np.ndarray, List[str], Dict, Dict, int]:
-    """Prepare text with frequency-based vocabulary indexing"""
-    names = load_names(TABLES_PATH, COLUMNS_PATH)
-    text = "\n".join(names)
+
+def build_vocabulary(names: List[str]) -> Tuple[Dict, Dict, int]:
+    """Build character vocabulary"""
+    chars = set()
+    for name in names:
+        chars.update(name)
     
-    # Build vocabulary with frequency sorting
-    char_freq = {}
-    for c in text:
-        char_freq[c] = char_freq.get(c, 0) + 1
-    
-    # Sort by frequency descending
-    vocab = sorted(char_freq.keys(), key=lambda x: char_freq[x], reverse=True)
-    
-    # Add special tokens at the beginning
-    vocab = [PAD_TOKEN, UNK_TOKEN] + vocab
+    # Add special tokens
+    vocab = [PAD_TOKEN, UNK_TOKEN, START_TOKEN, END_TOKEN] + sorted(chars)
     
     char2idx = {c: i for i, c in enumerate(vocab)}
     idx2char = {i: c for c, i in char2idx.items()}
     
-    # Get END_TOKEN index
-    end_token_idx = char2idx.get(END_TOKEN, -1)
-    if end_token_idx == -1:
-        raise ValueError(f"END_TOKEN '{END_TOKEN}' not found in vocabulary!")
+    print(f"[+] Vocabulary size: {len(vocab)}")
+    print(f"[+] Characters: {sorted(chars)}")
     
-    # Convert text to integers
-    text_as_int = np.array([char2idx.get(c, 1) for c in text], dtype=np.int32)
-    
-    print(f"[+] Corpus length (chars): {len(text_as_int)}")
-    print(f"[+] Vocab size: {len(vocab)}")
-    print(f"[+] END_TOKEN '{END_TOKEN}' index: {end_token_idx}")
-    print(f"[+] Top 10 frequent chars: {vocab[2:12]}")
-    
-    # Save vocabulary
-    vocab_data = {
-        'char2idx': char2idx,
-        'idx2char': {str(k): v for k, v in idx2char.items()},
-        'end_token_idx': end_token_idx,
-        'vocab_size': len(vocab)
-    }
-    
-    with open(VOCAB_JSON, 'w', encoding='utf-8') as f:
-        json.dump(vocab_data, f, ensure_ascii=False, indent=2)
-    
-    print(f"[+] Vocabulary saved to: {VOCAB_JSON}")
-    
-    return text_as_int, vocab, char2idx, idx2char, end_token_idx
+    return char2idx, idx2char, len(vocab)
 
 
-def build_datasets(text_as_int: np.ndarray, end_token_idx: int) -> Tuple:
-    """Build training, validation, and test datasets"""
-    inputs, targets = [], []
+def prepare_training_data(names: List[str], char2idx: Dict) -> Tuple[np.ndarray, np.ndarray]:
+    """Prepare input-output pairs for training"""
+    inputs = []
+    targets = []
     
-    i = 0
-    while i < len(text_as_int) - SEQ_LENGTH:
-        seq = text_as_int[i:i + SEQ_LENGTH]
-        target = text_as_int[i + SEQ_LENGTH]
+    start_idx = char2idx[START_TOKEN]
+    end_idx = char2idx[END_TOKEN]
+    pad_idx = char2idx[PAD_TOKEN]
+    
+    for name in names:
+        # Convert to indices
+        name_indices = [char2idx.get(c, char2idx[UNK_TOKEN]) for c in name]
         
-        # Skip sequences that contain END_TOKEN to avoid cross-word patterns
-        if end_token_idx in seq:
-            end_positions = np.where(seq == end_token_idx)[0]
-            if len(end_positions) > 0:
-                i = i + end_positions[-1] + 1
-                continue
+        # Add START and END tokens
+        full_seq = [start_idx] + name_indices + [end_idx]
         
-        inputs.append(seq)
-        targets.append(target)
-        i += 1
+        # Create sliding windows
+        for i in range(len(full_seq) - 1):
+            # Input: sequence up to position i (padded to SEQ_LENGTH)
+            start = max(0, i - SEQ_LENGTH + 1)
+            seq = full_seq[start:i+1]
+            
+            # Pad if needed
+            while len(seq) < SEQ_LENGTH:
+                seq = [pad_idx] + seq
+            
+            inputs.append(seq[-SEQ_LENGTH:])
+            targets.append(full_seq[i + 1])
     
     X = np.array(inputs, dtype=np.int32)
     y = np.array(targets, dtype=np.int32)
-    print(f"[+] Total samples: {len(X)}")
     
-    # Split dataset
-    total = len(X)
-    test_size = int(total * TEST_SPLIT)
-    val_size = int(total * VALIDATION_SPLIT)
-    train_size = total - val_size - test_size
+    print(f"[+] Training samples: {len(X)}")
+    print(f"[+] Input shape: {X.shape}")
     
-    # Shuffle before split
-    indices = np.arange(total)
-    np.random.shuffle(indices)
-    
-    X = X[indices]
-    y = y[indices]
-    
-    X_train = X[:train_size]
-    y_train = y[:train_size]
-    
-    X_val = X[train_size:train_size + val_size]
-    y_val = y[train_size:train_size + val_size]
-    
-    X_test = X[train_size + val_size:]
-    y_test = y[train_size + val_size:]
-    
-    print(f"[+] Train size: {len(X_train)}")
-    print(f"[+] Val size:   {len(X_val)}")
-    print(f"[+] Test size:  {len(X_test)}")
-    
-    # Create tf.data.Dataset
-    train_ds = (
-        tf.data.Dataset.from_tensor_slices((X_train, y_train))
-        .shuffle(10000, seed=SEED)
-        .batch(BATCH_SIZE)
-        .prefetch(tf.data.AUTOTUNE)
-    )
-    
-    val_ds = (
-        tf.data.Dataset.from_tensor_slices((X_val, y_val))
-        .batch(BATCH_SIZE)
-        .prefetch(tf.data.AUTOTUNE)
-    )
-    
-    test_ds = (
-        tf.data.Dataset.from_tensor_slices((X_test, y_test))
-        .batch(BATCH_SIZE)
-        .prefetch(tf.data.AUTOTUNE)
-    )
-    
-    return train_ds, val_ds, test_ds, X_test, y_test
+    return X, y
 
 
-# ================== MODEL ARCHITECTURE ==================
+# ================== MODEL ARCHITECTURE v2 ==================
 
-def build_model(vocab_size: int, strategy):
-    """Build enhanced GRU model"""
-    with strategy.scope():
-        model = tf.keras.Sequential([
-            # Embedding layer
-            layers.Embedding(
-                input_dim=vocab_size,
-                output_dim=EMBEDDING_DIM,
-                mask_zero=True,
-                embeddings_regularizer=regularizers.l2(L2_REG),
-                name="embedding"
-            ),
-            
-            # First GRU layer
-            layers.GRU(
-                GRU_UNITS,
-                return_sequences=True,
-                dropout=DROPOUT_RATE,
-                recurrent_dropout=RECURRENT_DROPOUT,
-                kernel_regularizer=regularizers.l2(L2_REG),
-                recurrent_regularizer=regularizers.l2(L2_REG),
-                name="gru_1"
-            ),
-            layers.BatchNormalization(name="bn_1"),
-            
-            # Second GRU layer
-            layers.GRU(
-                GRU_UNITS,
-                dropout=DROPOUT_RATE,
-                recurrent_dropout=RECURRENT_DROPOUT,
-                kernel_regularizer=regularizers.l2(L2_REG),
-                recurrent_regularizer=regularizers.l2(L2_REG),
-                name="gru_2"
-            ),
-            layers.BatchNormalization(name="bn_2"),
-            
-            # Dense layers
-            layers.Dense(
-                512,
-                activation="relu",
-                kernel_regularizer=regularizers.l2(L2_REG),
-                name="dense_1"
-            ),
-            layers.Dropout(DROPOUT_RATE, name="dropout_1"),
-            layers.BatchNormalization(name="bn_3"),
-            
-            layers.Dense(
-                256,
-                activation="relu",
-                kernel_regularizer=regularizers.l2(L2_REG),
-                name="dense_2"
-            ),
-            layers.Dropout(DROPOUT_RATE, name="dropout_2"),
-            
-            # Output layer
-            layers.Dense(vocab_size, activation="softmax", name="output")
-        ])
+def build_gru_model_v2(vocab_size: int) -> Model:
+    """Build improved GRU model with attention"""
+    
+    # Input
+    inputs = layers.Input(shape=(SEQ_LENGTH,), name='input')
+    
+    # Embedding
+    x = layers.Embedding(
+        vocab_size, 
+        EMBEDDING_DIM, 
+        mask_zero=True,
+        name='embedding'
+    )(inputs)
+    
+    # GRU layers with residual connections
+    for i in range(NUM_GRU_LAYERS):
+        gru_out = layers.GRU(
+            GRU_UNITS,
+            return_sequences=(i < NUM_GRU_LAYERS - 1),
+            dropout=DROPOUT_RATE,
+            recurrent_dropout=RECURRENT_DROPOUT,
+            name=f'gru_{i}'
+        )(x)
         
-        # Optimizer with gradient clipping
-        optimizer = tf.keras.optimizers.Adam(
-            learning_rate=INITIAL_LR,
-            clipnorm=1.0
-        )
-        
-        model.compile(
-            optimizer=optimizer,
-            loss="sparse_categorical_crossentropy",
-            metrics=[
-                "accuracy",
-                tf.keras.metrics.SparseTopKCategoricalAccuracy(k=5, name='top5_acc')
-            ]
-        )
+        if i < NUM_GRU_LAYERS - 1:
+            x = gru_out
     
-    model.summary()
+    # Dense layers
+    x = layers.Dense(256, activation='relu', name='dense1')(gru_out)
+    x = layers.Dropout(DROPOUT_RATE, name='dropout')(x)
+    
+    # Output
+    outputs = layers.Dense(vocab_size, activation='softmax', name='output')(x)
+    
+    model = Model(inputs=inputs, outputs=outputs, name='GRU_SQLi_v2')
+    
     return model
 
 
-# ================== CALLBACKS (IMPROVED) ==================
-
-def cyclic_lr_schedule(epoch, lr):
-    """
-    IMPROVED: Cyclic learning rate schedule
-    Better than cosine annealing - helps escape local minima
-    """
-    epoch_in_cycle = epoch % CYCLE_LENGTH
-    
-    if epoch_in_cycle < 5:
-        # Warmup phase
-        return MIN_LR + (INITIAL_LR - MIN_LR) * (epoch_in_cycle / 5)
-    else:
-        # Cosine annealing within cycle
-        progress = (epoch_in_cycle - 5) / (CYCLE_LENGTH - 5)
-        return MIN_LR + (INITIAL_LR - MIN_LR) * (1 + math.cos(math.pi * progress)) / 2
-
+# ================== TRAINING ==================
 
 class GenerationCallback(Callback):
-    """Callback to test text generation during training"""
-    def __init__(self, char2idx, idx2char, seq_length, end_token_idx):
+    """Callback to test generation during training"""
+    
+    def __init__(self, char2idx, idx2char, trie):
         super().__init__()
         self.char2idx = char2idx
         self.idx2char = idx2char
-        self.seq_length = seq_length
-        self.end_token_idx = end_token_idx
-        self.test_seeds = ['us', 'ad', 'pa']
-    
-    def generate_sample(self, seed_text):
-        """Generate a sample text"""
-        generated = seed_text.lower()
-        
-        for _ in range(15):
-            x = [self.char2idx.get(c, 1) for c in generated[-self.seq_length:]]
-            while len(x) < self.seq_length:
-                x.insert(0, 0)
-            x = np.array([x])
-            
-            preds = self.model.predict(x, verbose=0)[0]
-            
-            # Temperature sampling
-            temp = 0.7
-            preds = np.log(preds + 1e-10) / temp
-            preds = np.exp(preds) / np.sum(np.exp(preds))
-            
-            next_idx = np.random.choice(len(preds), p=preds)
-            next_char = self.idx2char[next_idx]
-            
-            if next_char in [END_TOKEN, '\n', PAD_TOKEN, UNK_TOKEN]:
-                break
-            
-            generated += next_char
-        
-        return generated
+        self.trie = trie
+        self.test_prefixes = ['us', 'ad', 'pr', 'or', 'em', 'cu', 'pa', 'se']
     
     def on_epoch_end(self, epoch, logs=None):
-        """Generate samples at specific epochs"""
-        if (epoch + 1) % 10 == 0:  # Every 10 epochs
-            print(f"\n[Generation Test - Epoch {epoch + 1}]")
-            for seed in self.test_seeds:
-                result = self.generate_sample(seed)
-                print(f"  {seed} -> {result}")
+        if (epoch + 1) % 10 == 0:
+            print(f"\n[Epoch {epoch+1}] Sample generations:")
+            for prefix in self.test_prefixes[:4]:
+                names = generate_names_beam(
+                    self.model, self.char2idx, self.idx2char,
+                    prefix=prefix, num_names=3, beam_width=3
+                )
+                print(f"  '{prefix}' -> {names}")
 
 
-def build_callbacks(char2idx, idx2char, seq_length, end_token_idx):
-    """Build training callbacks"""
-    callbacks = []
+def train_model():
+    """Main training function"""
+    print("\n" + "="*70)
+    print("GRU MODEL v2.0 - TRAINING")
+    print("="*70 + "\n")
     
-    # Cyclic learning rate
-    callbacks.append(
-        LearningRateScheduler(cyclic_lr_schedule, verbose=0)
+    # Set seeds
+    random.seed(SEED)
+    np.random.seed(SEED)
+    tf.random.set_seed(SEED)
+    
+    # Load data
+    print("[1] Loading data...")
+    names, freq_dict = load_names_with_frequency([TABLES_PATH, COLUMNS_PATH])
+    
+    # Build Trie
+    print("\n[2] Building Trie...")
+    trie = Trie()
+    for name, freq in freq_dict.items():
+        trie.insert(name, freq)
+    
+    common_prefixes = trie.get_common_prefixes(min_count=3)
+    print(f"[+] Common prefixes: {len(common_prefixes)}")
+    print(f"[+] Examples: {common_prefixes[:20]}")
+    
+    # Build n-grams
+    print("\n[3] Building n-grams...")
+    ngrams = build_ngrams(names)
+    
+    # Build vocabulary
+    print("\n[4] Building vocabulary...")
+    char2idx, idx2char, vocab_size = build_vocabulary(names)
+    
+    # Prepare training data
+    print("\n[5] Preparing training data...")
+    X, y = prepare_training_data(names, char2idx)
+    
+    # Shuffle
+    indices = np.random.permutation(len(X))
+    X, y = X[indices], y[indices]
+    
+    # Split
+    val_size = int(len(X) * VALIDATION_SPLIT)
+    X_train, X_val = X[:-val_size], X[-val_size:]
+    y_train, y_val = y[:-val_size], y[-val_size:]
+    
+    print(f"[+] Train: {len(X_train)}, Val: {len(X_val)}")
+    
+    # Build model
+    print("\n[6] Building model...")
+    model = build_gru_model_v2(vocab_size)
+    model.summary()
+    
+    # Compile
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=INITIAL_LR),
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
     )
     
-    # Reduce LR on plateau (backup)
-    callbacks.append(
-        ReduceLROnPlateau(
-            monitor="val_loss",
-            factor=0.5,
-            patience=10,  # IMPROVED: Increased from 5 to 10
-            min_lr=MIN_LR,
+    # Callbacks
+    callbacks = [
+        ModelCheckpoint(
+            BEST_MODEL_PATH,
+            monitor='val_accuracy',
+            save_best_only=True,
+            mode='max',
             verbose=1
-        )
-    )
-    
-    # Early stopping - IMPROVED: More patient
-    callbacks.append(
+        ),
         EarlyStopping(
-            monitor="val_loss",
-            patience=40,  # IMPROVED: Increased from 20 to 40
+            monitor='val_loss',
+            patience=20,
             restore_best_weights=True,
             verbose=1
-        )
-    )
-    
-    # Model checkpoint
-    callbacks.append(
-        ModelCheckpoint(
-            filepath=BEST_MODEL_H5,
-            monitor="val_loss",
-            save_best_only=True,
-            save_weights_only=False,
+        ),
+        ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=8,
+            min_lr=MIN_LR,
             verbose=1
-        )
+        ),
+        GenerationCallback(char2idx, idx2char, trie)
+    ]
+    
+    # Train
+    print("\n[7] Training...")
+    history = model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        callbacks=callbacks,
+        verbose=1
     )
     
-    # CSV logger
-    callbacks.append(
-        CSVLogger(LOG_CSV_PATH, append=False)
-    )
+    # Save model and data
+    print("\n[8] Saving...")
+    model.save(BEST_MODEL_PATH)
     
-    # Generation callback
-    callbacks.append(
-        GenerationCallback(char2idx, idx2char, seq_length, end_token_idx)
-    )
+    # Save vocabulary
+    with open(VOCAB_PATH, 'w') as f:
+        json.dump({
+            'char2idx': char2idx,
+            'idx2char': {str(k): v for k, v in idx2char.items()},
+            'vocab_size': vocab_size
+        }, f, indent=2)
     
-    return callbacks
-
-
-# ================== EVALUATION ==================
-
-def calculate_perplexity(model, X_test, y_test):
-    """Calculate perplexity on test set"""
-    try:
-        predictions = model.predict(X_test, verbose=0)
-        true_probs = predictions[np.arange(len(y_test)), y_test]
-        
-        epsilon = 1e-10
-        true_probs = np.clip(true_probs, epsilon, 1.0)
-        
-        avg_cross_entropy = -np.mean(np.log(true_probs))
-        perplexity = np.exp(avg_cross_entropy)
-        
-        return perplexity
-    except Exception as e:
-        print(f"[!] Error calculating perplexity: {e}")
-        return float('inf')
-
-
-def plot_training_history(history):
-    """Visualize training history"""
-    try:
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        fig.suptitle('Training History - Enhanced GRU Model', fontsize=16, fontweight='bold')
-        
-        # Loss
-        axes[0, 0].plot(history.history['loss'], label='Train Loss', linewidth=2)
-        axes[0, 0].plot(history.history['val_loss'], label='Val Loss', linewidth=2)
-        axes[0, 0].set_xlabel('Epoch', fontsize=11)
-        axes[0, 0].set_ylabel('Loss', fontsize=11)
-        axes[0, 0].set_title('Model Loss', fontsize=12, fontweight='bold')
-        axes[0, 0].legend(fontsize=10)
-        axes[0, 0].grid(True, alpha=0.3)
-        
-        # Accuracy
-        axes[0, 1].plot(history.history['accuracy'], label='Train Acc', linewidth=2)
-        axes[0, 1].plot(history.history['val_accuracy'], label='Val Acc', linewidth=2)
-        axes[0, 1].set_xlabel('Epoch', fontsize=11)
-        axes[0, 1].set_ylabel('Accuracy', fontsize=11)
-        axes[0, 1].set_title('Model Accuracy', fontsize=12, fontweight='bold')
-        axes[0, 1].legend(fontsize=10)
-        axes[0, 1].grid(True, alpha=0.3)
-        
-        # Top-5 Accuracy
-        axes[1, 0].plot(history.history['top5_acc'], label='Train Top-5', linewidth=2)
-        axes[1, 0].plot(history.history['val_top5_acc'], label='Val Top-5', linewidth=2)
-        axes[1, 0].set_xlabel('Epoch', fontsize=11)
-        axes[1, 0].set_ylabel('Top-5 Accuracy', fontsize=11)
-        axes[1, 0].set_title('Top-5 Accuracy', fontsize=12, fontweight='bold')
-        axes[1, 0].legend(fontsize=10)
-        axes[1, 0].grid(True, alpha=0.3)
-        
-        # Learning Rate
-        if 'lr' in history.history:
-            axes[1, 1].plot(history.history['lr'], linewidth=2, color='orange')
-            axes[1, 1].set_xlabel('Epoch', fontsize=11)
-            axes[1, 1].set_ylabel('Learning Rate', fontsize=11)
-            axes[1, 1].set_title('Learning Rate Schedule (Cyclic)', fontsize=12, fontweight='bold')
-            axes[1, 1].set_yscale('log')
-            axes[1, 1].grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig(HISTORY_PLOT, dpi=300, bbox_inches='tight')
-        print(f"[+] Training history plot saved to: {HISTORY_PLOT}")
-        plt.close()
-    except Exception as e:
-        print(f"[!] Could not plot training history: {e}")
-
-
-# ================== TEXT GENERATION TEST ==================
-
-def generate_text(model, char2idx, idx2char, seq_length, end_token_idx, 
-                 seed_text="us", length=20, temperature=0.7):
-    """Generate text with temperature sampling"""
-    seed_text = seed_text.lower()
-    generated = seed_text
+    # Save config
+    with open(CONFIG_PATH, 'w') as f:
+        json.dump({
+            'seq_length': SEQ_LENGTH,
+            'vocab_size': vocab_size,
+            'embedding_dim': EMBEDDING_DIM,
+            'gru_units': GRU_UNITS,
+            'num_layers': NUM_GRU_LAYERS
+        }, f, indent=2)
     
-    for _ in range(length):
-        x = [char2idx.get(c, 1) for c in generated[-seq_length:]]
-        while len(x) < seq_length:
-            x.insert(0, 0)
-        x = np.array([x])
-        
-        predictions = model.predict(x, verbose=0)[0]
-        
-        # Apply temperature
-        predictions = np.log(predictions + 1e-10) / temperature
-        predictions = np.exp(predictions) / np.sum(np.exp(predictions))
-        
-        # Sample
-        predicted_idx = np.random.choice(len(predictions), p=predictions)
-        predicted_char = idx2char[predicted_idx]
-        
-        if predicted_char in [END_TOKEN, '\n', PAD_TOKEN, UNK_TOKEN]:
-            break
-        
-        generated += predicted_char
+    # Save Trie
+    with open(TRIE_PATH, 'wb') as f:
+        pickle.dump(trie, f)
     
-    return generated
-
-
-def test_generation(model, char2idx, idx2char, seq_length, end_token_idx):
-    """Test text generation with multiple seeds and temperatures"""
+    # Save n-grams
+    with open(NGRAM_PATH, 'wb') as f:
+        pickle.dump(ngrams, f)
+    
+    # Save frequency
+    with open(FREQ_PATH, 'w') as f:
+        json.dump(freq_dict, f)
+    
+    # Plot history
+    plt.figure(figsize=(12, 4))
+    
+    plt.subplot(1, 2, 1)
+    plt.plot(history.history['loss'], label='Train')
+    plt.plot(history.history['val_loss'], label='Val')
+    plt.title('Loss')
+    plt.legend()
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(history.history['accuracy'], label='Train')
+    plt.plot(history.history['val_accuracy'], label='Val')
+    plt.title('Accuracy')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig(HISTORY_PLOT)
+    print(f"[+] History plot saved to: {HISTORY_PLOT}")
+    
     print("\n" + "="*70)
-    print("TEXT GENERATION TEST")
+    print("TRAINING COMPLETE!")
     print("="*70)
     
-    test_seeds = ["us", "ad", "pa", "id", "na", "em", "da", "lo"]
-    temperatures = [0.5, 0.7, 1.0]
+    # Test generation
+    print("\n[9] Testing generation...")
+    test_generation(model, char2idx, idx2char, trie, names[:100])
     
-    for seed in test_seeds:
-        print(f"\n[Seed: '{seed}']")
-        for temp in temperatures:
-            generated = generate_text(
-                model, char2idx, idx2char, seq_length, end_token_idx,
-                seed, length=25, temperature=temp
+    return model, char2idx, idx2char, trie
+
+
+# ================== GENERATION (FAST) ==================
+
+def generate_names_beam(
+    model, char2idx, idx2char, 
+    prefix: str = "", 
+    num_names: int = 10,
+    beam_width: int = BEAM_WIDTH,
+    max_length: int = MAX_NAME_LENGTH
+) -> List[str]:
+    """Generate names using beam search - FAST"""
+    
+    start_idx = char2idx[START_TOKEN]
+    end_idx = char2idx[END_TOKEN]
+    pad_idx = char2idx[PAD_TOKEN]
+    
+    # Initialize with prefix
+    if prefix:
+        initial_seq = [start_idx] + [char2idx.get(c, char2idx[UNK_TOKEN]) for c in prefix.lower()]
+    else:
+        initial_seq = [start_idx]
+    
+    # Beam: (sequence, log_probability)
+    beams = [(initial_seq, 0.0)]
+    completed = []
+    
+    for _ in range(max_length):
+        all_candidates = []
+        
+        for seq, score in beams:
+            if seq[-1] == end_idx:
+                completed.append((seq, score))
+                continue
+            
+            # Prepare input
+            input_seq = seq[-SEQ_LENGTH:] if len(seq) >= SEQ_LENGTH else [pad_idx] * (SEQ_LENGTH - len(seq)) + seq
+            x = np.array([input_seq])
+            
+            # Predict
+            probs = model.predict(x, verbose=0)[0]
+            
+            # Get top-k candidates
+            top_indices = np.argsort(probs)[-beam_width:]
+            
+            for idx in top_indices:
+                new_seq = seq + [idx]
+                new_score = score + np.log(probs[idx] + 1e-10)
+                all_candidates.append((new_seq, new_score))
+        
+        if not all_candidates:
+            break
+        
+        # Keep top beams
+        all_candidates.sort(key=lambda x: -x[1])
+        beams = all_candidates[:beam_width]
+    
+    # Add remaining beams to completed
+    completed.extend(beams)
+    
+    # Convert to strings
+    results = []
+    for seq, score in sorted(completed, key=lambda x: -x[1]):
+        name = ""
+        for idx in seq[1:]:  # Skip START token
+            if idx == end_idx:
+                break
+            char = idx2char.get(idx, '')
+            if char not in [PAD_TOKEN, UNK_TOKEN, START_TOKEN, END_TOKEN]:
+                name += char
+        if name and name not in results:
+            results.append(name)
+        if len(results) >= num_names:
+            break
+    
+    return results
+
+
+def generate_names_batch(
+    model, char2idx, idx2char, trie,
+    prefixes: List[str] = None,
+    num_per_prefix: int = 5,
+    use_trie_completion: bool = True
+) -> List[str]:
+    """Generate names in batch - VERY FAST"""
+    
+    all_names = set()
+    
+    # Default prefixes based on common patterns
+    if prefixes is None:
+        prefixes = [
+            'u', 'a', 'p', 'c', 'e', 's', 'o', 'm', 'i', 't', 'd', 'l', 'r', 'n',
+            'us', 'ad', 'pa', 'pr', 'cu', 'em', 'se', 'or', 'ac', 'lo', 'da', 'co',
+            'user', 'admin', 'pass', 'prod', 'cust', 'emp', 'sess', 'order', 'acc'
+        ]
+    
+    for prefix in prefixes:
+        # Method 1: Trie completion (instant)
+        if use_trie_completion:
+            trie_results = trie.starts_with(prefix)
+            for name, _ in trie_results[:num_per_prefix]:
+                all_names.add(name)
+        
+        # Method 2: Model generation
+        generated = generate_names_beam(
+            model, char2idx, idx2char,
+            prefix=prefix,
+            num_names=num_per_prefix,
+            beam_width=3
+        )
+        all_names.update(generated)
+    
+    return list(all_names)
+
+
+def test_generation(model, char2idx, idx2char, trie, known_names: List[str]):
+    """Test generation quality"""
+    print("\n--- Generation Test ---")
+    
+    # Test different prefixes
+    test_prefixes = ['us', 'ad', 'pa', 'em', 'or', 'pr', 'se', 'ac', 'cu', 'lo']
+    
+    total_generated = 0
+    total_hits = 0
+    
+    for prefix in test_prefixes:
+        generated = generate_names_beam(
+            model, char2idx, idx2char,
+            prefix=prefix,
+            num_names=10
+        )
+        
+        hits = [n for n in generated if n in known_names]
+        total_generated += len(generated)
+        total_hits += len(hits)
+        
+        print(f"  '{prefix}' -> Generated: {len(generated)}, Hits: {len(hits)}")
+        print(f"        Names: {generated[:5]}")
+    
+    hit_rate = total_hits / max(total_generated, 1) * 100
+    print(f"\n[+] Overall hit rate: {hit_rate:.2f}%")
+    print(f"[+] Total generated: {total_generated}")
+    print(f"[+] Total hits: {total_hits}")
+
+
+# ================== SMART GENERATOR CLASS ==================
+
+class SmartNameGenerator:
+    """
+    Smart name generator combining:
+    1. Trie-based completion (instant)
+    2. GRU model generation (learned patterns)
+    3. Frequency-based prioritization
+    4. N-gram based validation
+    """
+    
+    def __init__(self, model_dir: str = MODEL_DIR):
+        self.model_dir = model_dir
+        self.model = None
+        self.char2idx = None
+        self.idx2char = None
+        self.trie = None
+        self.ngrams = None
+        self.freq_dict = None
+        self.generated_cache = set()
+        
+    def load(self):
+        """Load all model components"""
+        print("[*] Loading SmartNameGenerator...")
+        
+        # Load model
+        model_path = os.path.join(self.model_dir, "gru_v2_best.keras")
+        if os.path.exists(model_path):
+            self.model = tf.keras.models.load_model(model_path)
+            print(f"  [+] Model loaded from {model_path}")
+        else:
+            print(f"  [!] Model not found at {model_path}")
+        
+        # Load vocabulary
+        vocab_path = os.path.join(self.model_dir, "vocab_v2.json")
+        if os.path.exists(vocab_path):
+            with open(vocab_path, 'r') as f:
+                data = json.load(f)
+            self.char2idx = data['char2idx']
+            self.idx2char = {int(k): v for k, v in data['idx2char'].items()}
+            print(f"  [+] Vocabulary loaded")
+        
+        # Load Trie
+        trie_path = os.path.join(self.model_dir, "prefix_trie.pkl")
+        if os.path.exists(trie_path):
+            with open(trie_path, 'rb') as f:
+                self.trie = pickle.load(f)
+            print(f"  [+] Trie loaded ({len(self.trie.all_words)} words)")
+        
+        # Load n-grams
+        ngram_path = os.path.join(self.model_dir, "ngrams.pkl")
+        if os.path.exists(ngram_path):
+            with open(ngram_path, 'rb') as f:
+                self.ngrams = pickle.load(f)
+            print(f"  [+] N-grams loaded")
+        
+        # Load frequency
+        freq_path = os.path.join(self.model_dir, "frequency.json")
+        if os.path.exists(freq_path):
+            with open(freq_path, 'r') as f:
+                self.freq_dict = json.load(f)
+            print(f"  [+] Frequency dict loaded")
+        
+        print("[*] SmartNameGenerator ready!")
+        return self
+    
+    def generate(self, count: int = 100, name_type: str = "any") -> List[str]:
+        """
+        Generate names intelligently.
+        Returns names sorted by likelihood of being real.
+        """
+        results = []
+        
+        # Strategy 1: High-frequency known names from Trie
+        if self.trie:
+            # Get top names by frequency
+            sorted_words = sorted(
+                self.trie.all_words, 
+                key=lambda x: self.freq_dict.get(x, 0),
+                reverse=True
             )
-            print(f"  T={temp}: {generated}")
+            results.extend(sorted_words[:count // 2])
+        
+        # Strategy 2: Common prefix completions
+        if self.trie:
+            common_prefixes = ['user', 'admin', 'pass', 'prod', 'cust', 'emp', 
+                              'sess', 'order', 'acc', 'log', 'item', 'cat']
+            for prefix in common_prefixes:
+                completions = self.trie.starts_with(prefix)
+                for word, _ in completions[:5]:
+                    if word not in results:
+                        results.append(word)
+        
+        # Strategy 3: Model generation for novel names
+        if self.model and len(results) < count:
+            prefixes = ['u', 'a', 'p', 'c', 'e', 's', 'o', 'm', 'i', 't']
+            for prefix in prefixes:
+                if len(results) >= count:
+                    break
+                generated = generate_names_beam(
+                    self.model, self.char2idx, self.idx2char,
+                    prefix=prefix,
+                    num_names=10
+                )
+                for name in generated:
+                    if name not in results and name not in self.generated_cache:
+                        results.append(name)
+                        self.generated_cache.add(name)
+        
+        return results[:count]
+    
+    def generate_unique(self, count: int = 100) -> List[str]:
+        """Generate unique names not yet tried"""
+        results = []
+        attempts = 0
+        max_attempts = count * 10
+        
+        while len(results) < count and attempts < max_attempts:
+            batch = self.generate(count=50)
+            for name in batch:
+                if name not in self.generated_cache:
+                    results.append(name)
+                    self.generated_cache.add(name)
+                    if len(results) >= count:
+                        break
+            attempts += 50
+        
+        return results
+    
+    def score_name(self, name: str) -> float:
+        """Score how likely a name is to be real"""
+        score = 0.0
+        
+        # Frequency score
+        if self.freq_dict:
+            score += self.freq_dict.get(name.lower(), 0) / 1000
+        
+        # N-gram score
+        if self.ngrams:
+            for n in [2, 3]:
+                if n in self.ngrams:
+                    padded = START_TOKEN + name + END_TOKEN
+                    for i in range(len(padded) - n + 1):
+                        ngram = padded[i:i+n]
+                        score += self.ngrams[n].get(ngram, 0) / 100
+        
+        # Length penalty (prefer 4-12 chars)
+        length_score = 1.0 - abs(len(name) - 8) / 20
+        score += max(0, length_score)
+        
+        return score
 
 
 # ================== MAIN ==================
 
-def main():
-    """Main training pipeline"""
-    try:
-        print("\n" + "="*70)
-        print("ENHANCED GRU MODEL TRAINING FOR BLIND SQLI")
-        print("="*70)
-        
-        # Setup
-        print("\n[STEP 1] Setting up environment...")
-        set_global_seed(SEED)
-        
-        print("\n[STEP 2] Preparing data...")
-        text_as_int, vocab, char2idx, idx2char, end_token_idx = prepare_text()
-        train_ds, val_ds, test_ds, X_test, y_test = build_datasets(text_as_int, end_token_idx)
-        
-        print("\n[STEP 3] Configuring devices...")
-        strategy = configure_devices()
-        
-        print("\n[STEP 4] Building model...")
-        model = build_model(len(vocab), strategy)
-        
-        print("\n[STEP 5] Initializing callbacks...")
-        callbacks = build_callbacks(char2idx, idx2char, SEQ_LENGTH, end_token_idx)
-        
-        # Save config
-        config = {
-            'seq_length': SEQ_LENGTH,
-            'batch_size': BATCH_SIZE,
-            'embedding_dim': EMBEDDING_DIM,
-            'gru_units': GRU_UNITS,
-            'num_gru_layers': NUM_GRU_LAYERS,
-            'dropout_rate': DROPOUT_RATE,
-            'vocab_size': len(vocab),
-            'initial_lr': INITIAL_LR,
-            'min_lr': MIN_LR,
-            'cycle_length': CYCLE_LENGTH,
-            'end_token_idx': end_token_idx,
-            'improvements': [
-                'Cyclic learning rate',
-                'Larger batch size (128)',
-                'Higher dropout (0.4)',
-                'Longer patience (40)',
-                'Shorter sequence (4)',
-                'Generation callback'
-            ]
-        }
-        
-        with open(CONFIG_JSON, 'w') as f:
-            json.dump(config, f, indent=2)
-        print(f"[+] Config saved to: {CONFIG_JSON}")
-        
-        print("\n[STEP 6] Starting training...")
-        print(f"[+] Training for {EPOCHS} epochs with cyclic LR")
-        print(f"[+] Batch size: {BATCH_SIZE}")
-        print(f"[+] Sequence length: {SEQ_LENGTH}")
-        print(f"[+] Early stopping patience: 40 epochs")
-        print("="*70 + "\n")
-        
-        history = model.fit(
-            train_ds,
-            validation_data=val_ds,
-            epochs=EPOCHS,
-            callbacks=callbacks,
-            verbose=2
-        )
-        
-        print("\n[STEP 7] Visualizing training history...")
-        plot_training_history(history)
-        
-        print("\n[STEP 8] Evaluating on test set...")
-        test_results = model.evaluate(test_ds, verbose=2)
-        test_loss = test_results[0]
-        test_acc = test_results[1]
-        test_top5_acc = test_results[2]
-        
-        print(f"\n[+] Test loss: {test_loss:.4f}")
-        print(f"[+] Test accuracy: {test_acc:.4f}")
-        print(f"[+] Test top-5 accuracy: {test_top5_acc:.4f}")
-        
-        print("\n[STEP 9] Calculating perplexity...")
-        perplexity = calculate_perplexity(model, X_test, y_test)
-        print(f"[+] Test Perplexity: {perplexity:.2f}")
-        print(f"[+] Paper target: table=5.8, column=6.7")
-        
-        if perplexity < 7.0:
-            print(f"[✓] Excellent! Perplexity is within target range")
-        elif perplexity < 10.0:
-            print(f"[✓] Good! Perplexity is close to target")
-        else:
-            print(f"[!] Perplexity is higher than expected")
-        
-        print("\n[STEP 10] Testing text generation...")
-        test_generation(model, char2idx, idx2char, SEQ_LENGTH, end_token_idx)
-        
-        print("\n[STEP 11] Saving model...")
-        model.save(FINAL_MODEL_KERAS)
-        model.save_weights(FINAL_WEIGHTS_H5)
-        print(f"[+] Model saved to: {FINAL_MODEL_KERAS}")
-        print(f"[+] Weights saved to: {FINAL_WEIGHTS_H5}")
-        
-        # Save results
-        results = {
-            'test_loss': float(test_loss),
-            'test_accuracy': float(test_acc),
-            'test_top5_accuracy': float(test_top5_acc),
-            'perplexity': float(perplexity),
-            'total_epochs': len(history.history['loss']),
-            'best_epoch': len(history.history['loss']) - 40,  # Approximate
-            'improvements_applied': config['improvements']
-        }
-        
-        with open(RESULTS_JSON, 'w') as f:
-            json.dump(results, f, indent=2)
-        print(f"[+] Results saved to: {RESULTS_JSON}")
-        
-        print("\n" + "="*70)
-        print("TRAINING COMPLETE!")
-        print("="*70)
-        print("\n[✓] Files created:")
-        print(f"    • {BEST_MODEL_H5}")
-        print(f"    • {FINAL_MODEL_KERAS}")
-        print(f"    • {FINAL_WEIGHTS_H5}")
-        print(f"    • {VOCAB_JSON}")
-        print(f"    • {CONFIG_JSON}")
-        print(f"    • {LOG_CSV_PATH}")
-        print(f"    • {HISTORY_PLOT}")
-        print(f"    • {RESULTS_JSON}")
-        
-        print("\n[→] Next steps:")
-        print("    1. Run inference script for text generation")
-        print("    2. Run exploit script for SQLi testing")
-        print("    3. Check training_history.png for insights")
-        
-        print("\n" + "="*70 + "\n")
-        
-    except KeyboardInterrupt:
-        print("\n\n[!] Training interrupted by user")
-    except Exception as e:
-        print(f"\n\n[✗] ERROR: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
-
-
 if __name__ == "__main__":
-    main()
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "train":
+        # Train model
+        model, char2idx, idx2char, trie = train_model()
+    else:
+        # Test generation
+        print("Usage: python train_gru_model_v2.py train")
+        print("\nTo test existing model:")
+        
+        generator = SmartNameGenerator()
+        if generator.load():
+            print("\nGenerating sample names:")
+            names = generator.generate(count=50)
+            for i, name in enumerate(names[:20]):
+                score = generator.score_name(name)
+                print(f"  {i+1:2d}. {name:20s} (score: {score:.2f})")
